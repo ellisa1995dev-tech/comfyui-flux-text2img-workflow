@@ -20,6 +20,12 @@ RUN comfy node install --exit-on-fail comfyui-art-venture
 # provides DF_Latent_Scale_to_side (Derfuu_ComfyUI_ModdedNodes)
 RUN comfy node install --exit-on-fail derfuu_comfyui_moddednodes
 
+# custom-node requirements can drag shared deps past the versions the base
+# image deliberately pinned — comfyui-art-venture declares a bare
+# `transformers`, and transformers 5.x / huggingface-hub 1.x break ComfyUI at
+# import. Re-assert the base image's pins after the node installs.
+RUN uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
 # download models into comfyui
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do HF_TOKEN=$HF_TOKEN comfy model download --url 'https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors' --relative-path models/text_encoders --filename 't5xxl_fp8_e4m3fn.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do HF_TOKEN=$HF_TOKEN comfy model download --url 'https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors' --relative-path models/text_encoders --filename 'clip_l.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
@@ -36,23 +42,9 @@ COPY api-workflow.json /api-workflow.json
 COPY handler.py /handler.py
 COPY test_input.json /test_input.json
 
-# build-time validation: every class_type used by the workflow must be
-# registered by ComfyUI (proves the custom nodes really installed), and every
-# model file the workflow names must exist. Runs on CPU — no GPU required.
-RUN set -eu; \
-    for f in /comfyui/models/unet/flux1-dev.safetensors \
-             /comfyui/models/vae/ae.sft \
-             /comfyui/models/text_encoders/t5xxl_fp8_e4m3fn.safetensors \
-             /comfyui/models/text_encoders/clip_l.safetensors; do \
-      [ -s "$f" ] || { echo "missing model file: $f" >&2; exit 1; }; \
-    done; \
-    cd /comfyui && python -c "\
-import asyncio, json, sys;\
-sys.argv = ['main.py', '--cpu'];\
-import nodes;\
-r = nodes.init_extra_nodes();\
-asyncio.run(r) if asyncio.iscoroutine(r) else None;\
-wf = json.load(open('/api-workflow.json'));\
-missing = sorted({n['class_type'] for n in wf.values()} - set(nodes.NODE_CLASS_MAPPINGS));\
-print('unresolved node classes:', missing) if missing else print('all workflow node classes resolved');\
-sys.exit(1 if missing else 0)"
+# build-time validation: models present, ComfyUI imports, and every workflow
+# class_type registered (proves the custom nodes really installed). Runs on
+# CPU — no GPU required. Prints its verdict last, so a tail-truncated build
+# log still shows why it failed.
+COPY scripts/validate_build.py /validate_build.py
+RUN python /validate_build.py
