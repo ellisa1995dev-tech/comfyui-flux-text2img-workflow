@@ -1,0 +1,6 @@
+# The Dockerfile embeds shell/python line continuations that break under CRLF,
+# and handler.py runs inside a Linux image. Keep these LF in every checkout.
+Dockerfile text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
