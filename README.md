@@ -6,6 +6,8 @@ Submission: https://comfy.getrunpod.io/dashboard/submissions/kd75kjrc919rgm15nsn
 
 ## Serverless API
 
+Full integration reference for backend consumers: [`docs/API.md`](docs/API.md).
+
 Send a job to the endpoint's `/run` or `/runsync`:
 
 ```json
