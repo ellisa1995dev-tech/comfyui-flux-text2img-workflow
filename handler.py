@@ -50,6 +50,16 @@ MIN_DIM = 64
 MAX_DIM = 2048
 DIM_STEP = 8
 
+# The bundled workflow sizes its latent through SDXLAspectRatioSelector set to
+# "1:1", whose source returns exactly (1024, 1024). Using those as the default
+# keeps generation byte-identical while letting the handler drive the latent
+# size directly -- which also drops that node from the submitted prompt.
+# ComfyUI rejects a prompt if ANY node's class_type is unregistered, even an
+# unused one (execution.py validate_prompt loops over every node before
+# resolving outputs), so an unresolvable node must be absent, not just unwired.
+DEFAULT_WIDTH = 1024
+DEFAULT_HEIGHT = 1024
+
 _WORKFLOW_CACHE = None
 
 
@@ -258,24 +268,64 @@ def _validate(job_input):
 # --------------------------------------------------------------------------
 
 
+def _is_referenced(workflow, node_id):
+    """True if any node still links to node_id."""
+    for other_id, node in workflow.items():
+        if other_id == node_id:
+            continue
+        for value in node.get("inputs", {}).values():
+            if isinstance(value, list) and len(value) == 2 and str(value[0]) == node_id:
+                return True
+    return False
+
+
+def _prune_detached(workflow, candidates):
+    """Drop nodes we disconnected that nothing else references, recursively.
+
+    Only nodes this handler itself unwired are considered, so an output node
+    is never a candidate. Pruning matters because ComfyUI validates the
+    class_type of every node in a submitted prompt, including unreachable
+    ones -- leaving an orphan behind fails the whole job.
+    """
+    removed = []
+    queue = list(candidates)
+    while queue:
+        node_id = queue.pop()
+        if node_id not in workflow or _is_referenced(workflow, node_id):
+            continue
+        upstream = [
+            str(v[0])
+            for v in workflow[node_id].get("inputs", {}).values()
+            if isinstance(v, list) and len(v) == 2
+        ]
+        del workflow[node_id]
+        removed.append(node_id)
+        queue.extend(upstream)
+    return removed
+
+
 def _apply_dimensions(workflow, width, height):
     """Set the base latent size and keep any latent rescale node consistent.
 
     In this workflow EmptyLatentImage's width/height are links from
     SDXLAspectRatioSelector, and the result is then resized by
     DF_Latent_Scale_to_side. Writing literal ints detaches the aspect-ratio
-    preset (the now-unused node simply is not executed), and the rescale
-    node's side_length is realigned so it does not undo the requested size.
+    preset, the detached node is pruned, and the rescale node's side_length is
+    realigned so it does not undo the requested size.
     """
     nid, latent = _find_latent_node(workflow)
     if latent is None:
         return "Could not locate an empty-latent node to apply width/height"
 
     inputs = latent["inputs"]
-    if width is not None:
-        inputs["width"] = width
-    if height is not None:
-        inputs["height"] = height
+    detached = set()
+    for field, value in (("width", width), ("height", height)):
+        if value is None:
+            continue
+        previous = inputs.get(field)
+        if isinstance(previous, list) and len(previous) == 2:
+            detached.add(str(previous[0]))
+        inputs[field] = value
 
     final_w = inputs.get("width")
     final_h = inputs.get("height")
@@ -293,6 +343,8 @@ def _apply_dimensions(workflow, width, height):
             scaler["inputs"]["side_length"] = final_w
         elif side == "Height":
             scaler["inputs"]["side_length"] = final_h
+
+    _prune_detached(workflow, detached)
     return None
 
 
@@ -304,6 +356,11 @@ def build_workflow(params):
     workflow = params.get("workflow")
     if workflow is None:
         workflow = _load_workflow()
+        # Drive the latent size directly for the bundled workflow. Same values
+        # its aspect-ratio node produces, but it keeps the graph free of that
+        # node. A caller-supplied workflow is left exactly as sent.
+        params.setdefault("width", DEFAULT_WIDTH)
+        params.setdefault("height", DEFAULT_HEIGHT)
     else:
         if isinstance(workflow, str):
             try:
