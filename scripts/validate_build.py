@@ -28,12 +28,32 @@ WORKFLOW = "/api-workflow.json"
 COMFY_DIR = "/comfyui"
 REPORT_PATH = "/build_validation.txt"
 
-REQUIRED_MODELS = [
-    "/comfyui/models/unet/flux1-dev.safetensors",
-    "/comfyui/models/vae/ae.sft",
-    "/comfyui/models/text_encoders/t5xxl_fp8_e4m3fn.safetensors",
-    "/comfyui/models/text_encoders/clip_l.safetensors",
-]
+MODELS_DIR = "/comfyui/models"
+MODEL_EXTS = (".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf")
+
+
+def required_models(workflow):
+    """Model filenames the workflow names, read from the graph itself.
+
+    Derived rather than hard-coded so this works unchanged for any workflow
+    bundled into the image -- the benchmark variants included.
+    """
+    names = set()
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        for value in node.get("inputs", {}).values():
+            if isinstance(value, str) and value.lower().endswith(MODEL_EXTS):
+                names.add(value)
+    return sorted(names)
+
+
+def find_model(name):
+    """Locate a model file anywhere under the models tree."""
+    for root, _dirs, files in os.walk(MODELS_DIR):
+        if name in files:
+            return os.path.join(root, name)
+    return None
 
 lines = []
 warnings = []
@@ -92,13 +112,32 @@ if os.path.isdir(custom_nodes_dir):
         if os.path.isdir(os.path.join(custom_nodes_dir, d)):
             say("  custom_node      %s" % d)
 
+# --- 0. the workflow this image bundles ------------------------------------
+say()
+say("--- workflow ---")
+workflow = None
+try:
+    with open(WORKFLOW, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+    say("  %s  (%d nodes)" % (WORKFLOW, len(workflow)))
+except Exception:  # noqa: BLE001
+    say("  could not read %s" % WORKFLOW)
+    for line in traceback.format_exc().splitlines():
+        say("    " + line)
+    warn("could not read %s:\n%s" % (WORKFLOW, traceback.format_exc()))
+    finish()
+
 # --- 1. model files --------------------------------------------------------
 say()
 say("--- models ---")
-for path in REQUIRED_MODELS:
-    if not os.path.isfile(path):
-        say("  MISSING  %s" % path)
-        warn("missing model file: %s" % path)
+wanted = required_models(workflow)
+if not wanted:
+    say("  (workflow names no model files)")
+for name in wanted:
+    path = find_model(name)
+    if path is None:
+        say("  MISSING  %s" % name)
+        warn("missing model file: %s (not found anywhere under %s)" % (name, MODELS_DIR))
     elif os.path.getsize(path) == 0:
         say("  EMPTY    %s" % path)
         warn("empty model file: %s" % path)
@@ -169,14 +208,6 @@ for msg in import_failures:
 # --- 3. workflow node classes ---------------------------------------------
 say()
 say("--- workflow node classes ---")
-try:
-    with open(WORKFLOW, "r", encoding="utf-8") as f:
-        workflow = json.load(f)
-except Exception:  # noqa: BLE001
-    say("  could not read %s" % WORKFLOW)
-    warn("could not read %s:\n%s" % (WORKFLOW, traceback.format_exc()))
-    finish()
-
 registered = set(getattr(nodes, "NODE_CLASS_MAPPINGS", {}))
 required = sorted({n["class_type"] for n in workflow.values()})
 missing = [c for c in required if c not in registered]
