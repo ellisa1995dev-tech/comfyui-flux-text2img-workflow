@@ -496,6 +496,31 @@ def build_workflow(params):
     return workflow, None
 
 
+def _effective_settings(workflow):
+    """Read back what the submitted graph will actually run.
+
+    Echoing the *injected* parameter would only prove the handler parsed the
+    request. Reading the values out of the finished graph proves they reached
+    the nodes ComfyUI will execute -- which is what a benchmark needs in order
+    to trust a step-count comparison.
+    """
+    out = {}
+    for _, node in _nodes_of_type(workflow, "BasicScheduler", "KSampler",
+                                  "KSamplerAdvanced"):
+        inputs = node.get("inputs", {})
+        for field in ("steps", "cfg", "sampler_name", "scheduler", "denoise"):
+            value = inputs.get(field)
+            if value is not None and not isinstance(value, list) and field not in out:
+                out[field] = value
+    _, latent = _find_latent_node(workflow)
+    if latent is not None:
+        for field in ("width", "height", "batch_size"):
+            value = latent.get("inputs", {}).get(field)
+            if isinstance(value, int):
+                out[field] = value
+    return out
+
+
 def handler(job):
     """RunPod Serverless handler: inject parameters, then run the stock worker."""
     params, error = _validate(job.get("input"))
@@ -524,6 +549,8 @@ def handler(job):
         # Echo the effective seed so a randomly chosen one can be reused, and
         # the composed prompt so the caller can see what was actually sent.
         result["seed"] = params["seed"]
+        # What the graph actually ran, read back from the submitted workflow.
+        result["effective"] = _effective_settings(workflow)
         if "composed_prompt" in params:
             result["prompt"] = params["composed_prompt"]
         if params.get("output_format", "png") != "png":
