@@ -223,6 +223,47 @@ api.last_elapsed = 0.0
 api.last_bytes = 0
 
 
+def download(url, timeout=120):
+    """Fetch an object-storage URL. Returns (bytes, seconds).
+
+    No Authorization header: these are presigned URLs on a different host, and
+    sending the RunPod key to a storage endpoint would leak it. The URL itself
+    carries a signature, so it is never printed in full.
+    """
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path + (("?" + parts.query) if parts.query else "")
+    started = time.monotonic()
+    for attempt in (1, 2):
+        conn = _conn_for(parts.netloc, True)
+        try:
+            conn.request("GET", path, None, {"Accept": "*/*"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            break
+        except (http.client.HTTPException, OSError):
+            _CONNS.pop(parts.netloc, None)
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if attempt == 2:
+                raise
+    if resp.status >= 400:
+        raise RuntimeError("storage GET %s returned %s" % (parts.netloc, resp.status))
+    return raw, time.monotonic() - started
+
+
+def image_ext(blob, fallback_name=""):
+    """Extension matching the actual bytes, not the declared name."""
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "webp"
+    if blob[:2] == b"\xff\xd8":
+        return "jpg"
+    return os.path.splitext(fallback_name)[1].lstrip(".") or "bin"
+
+
 def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
     """Submit one job and poll until it settles. Returns a result dict.
 
@@ -234,7 +275,7 @@ def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
     body = {"input": {"prompt": prompt, "seed": seed}}
     if steps is not None:
         body["input"]["steps"] = steps
-    for k in ("width", "height", "output_format"):
+    for k in ("width", "height", "output_format", "delivery"):
         if opts.get(k) is not None:
             body["input"][k] = opts[k]
     reuse = opts.get("reuse", True)
@@ -281,6 +322,11 @@ def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
                 "images": images,
                 "seed_used": (job.get("output") or {}).get("seed"),
                 "effective": (job.get("output") or {}).get("effective") or {},
+                # Server-side stage timings reported by the handler.
+                "encode_s": ((job.get("output") or {}).get("timings") or {}).get("encode_s"),
+                "upload_s": ((job.get("output") or {}).get("delivery") or {}).get("upload_s"),
+                "delivery_mode": ((job.get("output") or {}).get("delivery") or {}).get("mode")
+                                 or "inline",
             }
 
         if status not in ("IN_QUEUE", "IN_PROGRESS"):
@@ -348,6 +394,10 @@ def main():
     ap.add_argument("--height", type=int, default=None, help="output height (multiple of 8)")
     ap.add_argument("--output-format", choices=("png", "webp", "jpeg"), default=None,
                     dest="output_format", help="ask the handler to re-encode the image")
+    ap.add_argument("--delivery", choices=("inline", "url"), default=None,
+                    help="inline: image returned as base64 in the response. "
+                         "url: uploaded to object storage, response carries a link. "
+                         "Omit to let the endpoint's own configuration decide.")
     ap.add_argument("--no-reuse", action="store_true",
                     help="open a new TLS connection per call (measures keep-alive benefit)")
     args = ap.parse_args()
@@ -371,7 +421,8 @@ def main():
     print("runs     : %d (sequential)" % len(plan))
     print("size     : %s" % ("%dx%d" % (args.width, args.height)
                              if args.width and args.height else "workflow default"))
-    print("format   : %s" % (args.output_format or "png (default)"))
+    print("format   : %s" % (args.output_format or "handler default"))
+    print("delivery : %s" % (args.delivery or "endpoint default"))
     print("conn     : %s" % ("new per call" if args.no_reuse else "keep-alive"))
     print("steps    : %s" % (args.steps if args.steps is not None else
                              ("sweep %s" % (STEP_SWEEP,) if args.mode == "latency"
@@ -388,6 +439,7 @@ def main():
         r = run_one(base, key, prompt, seed, steps_for(i), args.interval, args.timeout,
                     opts={"width": args.width, "height": args.height,
                           "output_format": args.output_format,
+                          "delivery": args.delivery,
                           "reuse": not args.no_reuse})
         r["run"] = i + 1
         r["category"] = category
@@ -396,26 +448,39 @@ def main():
         r["steps_requested"] = steps_for(i)
 
         if r.get("ok"):
+            download_s, out_bytes = 0.0, 0
             for n, img in enumerate(r.pop("images")):
-                if img.get("type") != "base64":
-                    print("     (image is %s, not base64 - not saved)" % img.get("type"))
+                kind = img.get("type")
+                try:
+                    if kind == "base64":
+                        blob = base64.b64decode(img["data"])
+                    elif kind == "s3_url":
+                        # Fetch what the client would fetch, and time it
+                        # separately from the server-side upload.
+                        blob, dl = download(img["data"])
+                        download_s += dl
+                    else:
+                        print("     (image type %s - not saved)" % kind)
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    print("     (could not retrieve image: %s)" % exc)
                     continue
+
+                out_bytes += len(blob)
                 safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in category)
-                # Name the file after what the bytes actually are. The handler
+                # Name the file after what the bytes actually are: the handler
                 # can return WEBP or JPEG, and writing those under a .png name
                 # makes later analysis silently compare the wrong thing.
-                blob = base64.b64decode(img["data"])
-                if blob[:8] == b"\x89PNG\r\n\x1a\n":
-                    ext = "png"
-                elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
-                    ext = "webp"
-                elif blob[:2] == b"\xff\xd8":
-                    ext = "jpg"
-                else:
-                    ext = os.path.splitext(img.get("filename", ""))[1].lstrip(".") or "bin"
-                name = "run%02d_%s_seed%d%s.%s" % (i + 1, safe, seed,
-                                                   "" if n == 0 else "_%d" % n, ext)
+                name = "run%02d_%s_seed%d%s.%s" % (
+                    i + 1, safe, seed, "" if n == 0 else "_%d" % n,
+                    image_ext(blob, img.get("filename", "")))
                 (outdir / name).write_bytes(blob)
+            r["download_s"] = round(download_s, 3)
+            r["output_bytes"] = out_bytes
+            # What the customer actually waits for: response plus fetching the
+            # image. For inline delivery the image is already in the response,
+            # so download_s is zero and the two are the same.
+            r["total_s"] = r["wall_s"] + download_s
             print("  %2d  %-21s  %-14s  %6.2f  %6.2f  %6.2f"
                   % (r["run"], category[:21], (r.get("worker") or "?")[:14],
                      r["delay_s"], r["exec_s"], r["wall_s"]))
@@ -533,7 +598,24 @@ def main():
         if pb:
             print("       %-28s %6.2f MB (%d polls avg)"
                   % ("response payload", pb / 1e6, avg("polls") or 0))
-        print("    end-to-end              %6.2f s" % statistics.fmean(r["wall_s"] for r in warm))
+
+        # Server-side stages the handler reports, plus the client fetch.
+        modes = {r.get("delivery_mode") for r in warm}
+        print("    delivery mode           %s" % ", ".join(sorted(str(m) for m in modes)))
+        for field, lbl in (("encode_s", "WebP encode (server)"),
+                           ("upload_s", "object-storage upload"),
+                           ("download_s", "client download")):
+            v = avg(field)
+            if v:
+                print("       %-28s %6.2f s" % (lbl, v))
+        ob = avg("output_bytes")
+        if ob:
+            print("       %-28s %6.2f MB" % ("image size", ob / 1e6))
+
+        print("    API response            %6.2f s" % statistics.fmean(r["wall_s"] for r in warm))
+        tot = avg("total_s")
+        if tot:
+            print("    END-TO-END (incl. fetch)%6.2f s" % tot)
         if fit:
             fixed, per_step = fit
             print()

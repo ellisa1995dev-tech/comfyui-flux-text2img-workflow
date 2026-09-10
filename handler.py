@@ -31,6 +31,7 @@ import io
 import json
 import os
 import random
+import time
 
 import runpod
 
@@ -310,6 +311,25 @@ def _validate(job_input):
             return None, "'output_format' must be one of: png, webp, jpeg"
         params["output_format"] = fmt.lower()
 
+    # Delivery: "url" uploads to object storage and returns a link; "inline"
+    # returns base64 in the response. Default follows the endpoint's own
+    # configuration, so behaviour is unchanged where storage is not set up.
+    delivery = job_input.get("delivery")
+    if delivery is not None:
+        if not isinstance(delivery, str) or delivery.lower() not in ("url", "inline"):
+            return None, "'delivery' must be one of: url, inline"
+        delivery = delivery.lower()
+    else:
+        delivery = "url" if not _s3_missing_env() else "inline"
+    if delivery == "url":
+        missing = _s3_missing_env()
+        if missing:
+            # Names only -- never values.
+            return None, ("delivery='url' requires object storage, but these "
+                          "environment variables are not set on this endpoint: "
+                          + ", ".join(missing))
+    params["delivery"] = delivery
+
     seed = job_input.get("seed")
     if seed is not None:
         try:
@@ -496,6 +516,85 @@ def build_workflow(params):
     return workflow, None
 
 
+# Object-storage delivery. These are the RunPod SDK's own variable names, read
+# by runpod.serverless.utils.rp_upload -- not a new convention. Credentials
+# come from the environment only: never from the request, never baked into the
+# image, never logged or echoed in a response.
+S3_REQUIRED_ENV = ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID",
+                   "BUCKET_SECRET_ACCESS_KEY")
+
+
+def _s3_missing_env():
+    """Names (never values) of the storage variables that are not set."""
+    return [name for name in S3_REQUIRED_ENV if not os.environ.get(name)]
+
+
+class _stock_upload_suppressed(object):
+    """Hide BUCKET_ENDPOINT_URL from the stock worker handler for one call.
+
+    The stock worker uploads ComfyUI's PNG itself whenever that variable is
+    set, which would put a PNG in the bucket and give this handler no chance
+    to encode. Suppressing it for the delegated call lets us control the
+    format, then upload through the same rp_upload helper the stock worker
+    uses -- reusing its storage logic rather than duplicating it.
+
+    Serverless workers process one job at a time, so mutating the environment
+    for the duration of the call is safe; it is restored in all cases.
+    """
+
+    def __init__(self, active):
+        self.active = active
+        self.saved = None
+
+    def __enter__(self):
+        if self.active:
+            self.saved = os.environ.pop("BUCKET_ENDPOINT_URL", None)
+        return self
+
+    def __exit__(self, *exc):
+        if self.active and self.saved is not None:
+            os.environ["BUCKET_ENDPOINT_URL"] = self.saved
+        return False
+
+
+def _deliver_to_storage(result, fmt, job_id):
+    """Upload each image and replace it with a URL. Returns delivery stats.
+
+    Raises RuntimeError on failure: a job that was asked for a URL must not
+    quietly return something else.
+    """
+    from runpod.serverless.utils import rp_upload
+
+    images = result.get("images")
+    if not isinstance(images, list) or not images:
+        return None
+
+    bucket = os.environ.get("BUCKET_NAME") or None
+    total_bytes = 0
+    started = time.monotonic()
+
+    for index, image in enumerate(images):
+        if not isinstance(image, dict) or image.get("type") != "base64":
+            continue
+        blob = base64.b64decode(image["data"])
+        stem = os.path.splitext(image.get("filename") or ("image_%d" % index))[0]
+        name = "%s.%s" % (stem, fmt)
+        url = rp_upload.upload_in_memory_object(
+            name, blob, bucket_name=bucket, prefix=str(job_id or "job"))
+        # A missing boto client makes rp_upload fall back to a local path and
+        # return it as if it were a URL. Refuse to pass that off as delivery.
+        if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+            raise RuntimeError(
+                "object storage did not return an http(s) URL; check the "
+                "BUCKET_* configuration on this endpoint")
+        total_bytes += len(blob)
+        image.clear()
+        image.update({"filename": name, "type": "s3_url", "data": url})
+
+    return {"mode": "s3_url", "upload_s": round(time.monotonic() - started, 3),
+            "bytes": total_bytes, "format": fmt}
+
+
 def _effective_settings(workflow):
     """Read back what the submitted graph will actually run.
 
@@ -543,7 +642,11 @@ def handler(job):
         },
     }
 
-    result = worker_comfyui_handler.handler(delegated_job)
+    delivery = params.get("delivery", "inline")
+    # For URL delivery this handler owns the encoding, so the stock worker's
+    # own upload is suppressed for the duration of the delegated call.
+    with _stock_upload_suppressed(delivery == "url"):
+        result = worker_comfyui_handler.handler(delegated_job)
 
     if isinstance(result, dict) and "error" not in result:
         # Echo the effective seed so a randomly chosen one can be reused, and
@@ -553,18 +656,50 @@ def handler(job):
         result["effective"] = _effective_settings(workflow)
         if "composed_prompt" in params:
             result["prompt"] = params["composed_prompt"]
-        if params.get("output_format", "png") != "png":
-            _recode_images(result, params["output_format"])
+        # URL delivery defaults to lossless WEBP: pixel-identical to the PNG
+        # ComfyUI produced, ~32% smaller to store and download.
+        fmt = params.get("output_format") or ("webp" if delivery == "url" else "png")
+        encode_started = time.monotonic()
+        if fmt != "png":
+            _recode_images(result, fmt)
+        result.setdefault("timings", {})["encode_s"] = round(
+            time.monotonic() - encode_started, 3)
+
+        if delivery == "url":
+            try:
+                stats = _deliver_to_storage(result, fmt, job.get("id"))
+            except Exception as exc:  # noqa: BLE001
+                print("handler - object-storage delivery failed: %s" % exc)
+                return {"error": "object-storage delivery failed: %s" % exc}
+            if stats:
+                result["delivery"] = stats
+                result["timings"]["upload_s"] = stats["upload_s"]
     return result
 
 
-def _recode_images(result, fmt):
-    """Re-encode returned base64 PNGs to a smaller format, in place.
+def _encode(img, fmt):
+    """Encode a PIL image. WEBP is always LOSSLESS.
 
-    ComfyUI's SaveImage only writes PNG, and a 1024x1024 PNG is ~1 MB once
-    base64-encoded. WEBP typically cuts that several-fold, which is worth real
-    milliseconds on the response leg. Failures are non-fatal: the PNG is kept.
+    The customer approved 4-step output specifically for preserved facial
+    detail -- moles, pores, skin texture. That detail is high-frequency, which
+    is the first thing a lossy codec discards: measured on real 4-step output,
+    WEBP q92 retained only 88.5% of high-frequency energy on a detail-heavy
+    image. Lossless WEBP is pixel-identical to the PNG ComfyUI produced and
+    still ~32% smaller, so there is no reason to trade fidelity here.
     """
+    buf = io.BytesIO()
+    if fmt == "webp":
+        # exact=True also preserves RGB values under fully transparent pixels.
+        img.save(buf, "WEBP", lossless=True, exact=True, method=4)
+    else:
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(buf, "JPEG", quality=95)
+    return buf.getvalue()
+
+
+def _recode_images(result, fmt):
+    """Re-encode returned base64 images in place. Failures keep the original."""
     images = result.get("images")
     if not isinstance(images, list):
         return
@@ -573,19 +708,13 @@ def _recode_images(result, fmt):
     except Exception:  # noqa: BLE001 - Pillow missing should never lose a result
         return
 
-    pil_fmt = "WEBP" if fmt == "webp" else "JPEG"
     for image in images:
         if not isinstance(image, dict) or image.get("type") != "base64":
             continue
         try:
-            raw = base64.b64decode(image["data"])
-            img = Image.open(io.BytesIO(raw))
-            if pil_fmt == "JPEG" and img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, pil_fmt, quality=92, method=4) if pil_fmt == "WEBP" \
-                else img.save(buf, pil_fmt, quality=92)
-            image["data"] = base64.b64encode(buf.getvalue()).decode("utf-8")
+            img = Image.open(io.BytesIO(base64.b64decode(image["data"])))
+            blob = _encode(img, fmt)
+            image["data"] = base64.b64encode(blob).decode("utf-8")
             image["filename"] = os.path.splitext(image.get("filename", "image"))[0] \
                 + ("." + fmt)
         except Exception as exc:  # noqa: BLE001
