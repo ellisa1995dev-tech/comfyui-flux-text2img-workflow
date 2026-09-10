@@ -1,0 +1,44 @@
+# FLUX.2 [klein] 4B - candidate production image (benchmark first).
+#
+# Deploy as a SEPARATE RunPod endpoint alongside the current one:
+#   Dockerfile path: /bench/Dockerfile.klein4b
+# See bench/README.md and docs/PIPELINE.md.
+#
+# Why this model: klein 4B is the only FLUX.2 variant released under Apache-2.0
+# (9B and dev are non-commercial, per BFL's own model card), it is step- and
+# guidance-distilled for 4-step sampling, and it fits ~13 GB VRAM.
+FROM runpod/worker-comfyui:5.10.0-base
+
+# Not required for these weights - all defaults below are ungated. Kept so a
+# gated override can still be passed the same way the production image does.
+ARG HF_TOKEN=""
+
+# fp8 diffusion weights (4.07 GB) instead of bf16 (7.75 GB): halves both the
+# cold-start read and resident VRAM. The text encoder stays bf16 by default --
+# an fp4 build exists (3.85 GB) but nvfp4 wants Blackwell-class hardware, so it
+# is an override rather than the default.
+ARG KLEIN_UNET_URL="https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors"
+ARG KLEIN_TE_URL="https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+ARG KLEIN_VAE_URL="https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b/resolve/main/split_files/vae/flux2-vae.safetensors"
+
+# rgthree is not used by this workflow; only nodes shipped with ComfyUI are.
+# Nothing is installed that the graph does not execute.
+
+# Re-assert the base image's pins in case any later step disturbs them.
+RUN uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# download models into comfyui (same retry/backoff shape as the production image)
+RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do HF_TOKEN=$HF_TOKEN comfy model download --url "$KLEIN_UNET_URL" --relative-path models/unet --filename 'flux-2-klein-4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do HF_TOKEN=$HF_TOKEN comfy model download --url "$KLEIN_TE_URL" --relative-path models/text_encoders --filename 'qwen_3_4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do HF_TOKEN=$HF_TOKEN comfy model download --url "$KLEIN_VAE_URL" --relative-path models/vae --filename 'flux2-vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+
+# serverless wiring - identical to production: start.sh already boots ComfyUI
+# and then runs `python -u /handler.py`, so no CMD/ENTRYPOINT override.
+RUN test -f /handler.py && mv /handler.py /worker_comfyui_handler.py
+COPY bench/api-workflow-klein4b.json /api-workflow.json
+COPY handler.py /handler.py
+COPY test_input.json /test_input.json
+
+# build-time report (always exits 0; see scripts/validate_build.py)
+COPY scripts/validate_build.py /validate_build.py
+RUN python /validate_build.py

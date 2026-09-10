@@ -25,7 +25,9 @@ A raw `workflow` may still be supplied, matching the stock worker's API; any
 of the parameters above are then applied on top of it.
 """
 
+import base64
 import copy
+import io
 import json
 import os
 import random
@@ -61,6 +63,54 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 _WORKFLOW_CACHE = None
+
+# Structured customer requirements, grouped into sentences. Order matters:
+# earlier text carries more weight, so subject and appearance lead.
+#
+# Values are copied VERBATIM -- never reworded, reordered within a field, or
+# dropped. The only thing this adds is sentence grouping, because FLUX.2's
+# text encoder is an LLM (Qwen3-4B) and reads fluent prose better than a comma
+# soup of tags. No model call is made: rewriting a customer's brief through an
+# LLM costs latency and silently loses requirements, which is the opposite of
+# what this pipeline is for.
+REQUIREMENT_GROUPS = (
+    ("subject", "appearance", "clothing", "pose", "expression"),
+    ("environment", "background", "lighting", "camera", "composition"),
+    ("style", "color", "notes"),
+)
+REQUIREMENT_FIELDS = tuple(f for group in REQUIREMENT_GROUPS for f in group)
+
+
+def compose_prompt(requirements):
+    """Build a prompt from structured requirements. Returns (prompt, error)."""
+    if not isinstance(requirements, dict):
+        return None, "'requirements' must be a JSON object"
+
+    unknown = [k for k in requirements if k not in REQUIREMENT_FIELDS]
+    if unknown:
+        return None, "unknown requirement field(s): %s. Supported: %s" % (
+            ", ".join(sorted(unknown)),
+            ", ".join(REQUIREMENT_FIELDS),
+        )
+
+    sentences = []
+    for group in REQUIREMENT_GROUPS:
+        parts = []
+        for field in group:
+            value = requirements.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                return None, "'%s' must be a string" % field
+            value = value.strip().rstrip(".,")
+            if value:
+                parts.append(value)
+        if parts:
+            sentences.append(", ".join(parts))
+
+    if not sentences:
+        return None, "'requirements' contained no usable fields"
+    return ". ".join(sentences) + ".", None
 
 
 def _load_workflow():
@@ -159,7 +209,17 @@ def _find_seed_target(workflow):
 
     for nid, sampler in _nodes_of_type(workflow, "KSampler", "KSamplerAdvanced"):
         for field in ("seed", "noise_seed"):
-            if field in sampler.get("inputs", {}):
+            if field not in sampler.get("inputs", {}):
+                continue
+            # The sampler's seed may itself be a link (a "Seed (rgthree)" node,
+            # say). Writing a literal there would be silently ignored, because
+            # the link wins -- so follow it to the node that really holds it.
+            src_id, src = _resolve_link(workflow, sampler["inputs"][field])
+            if src is not None:
+                for src_field in ("seed", "noise_seed", "value"):
+                    if src_field in src.get("inputs", {}):
+                        return src_id, src, src_field
+            else:
                 return nid, sampler, field
 
     return None, None, None
@@ -171,7 +231,11 @@ def _find_latent_node(workflow):
     if node:
         return nid, node
     found = _nodes_of_type(
-        workflow, "EmptyLatentImage", "EmptySD3LatentImage", "EmptyLatentImagePresets"
+        workflow,
+        "EmptyLatentImage",
+        "EmptySD3LatentImage",
+        "EmptyLatentImagePresets",
+        "EmptyFlux2LatentImage",
     )
     return found[0] if len(found) == 1 else (None, None)
 
@@ -216,10 +280,35 @@ def _validate(job_input):
             return None, "'prompt' must be a non-empty string"
         params["prompt"] = prompt
 
+    # Structured requirements are composed into a prompt. An explicit `prompt`
+    # always wins, so a caller can bypass composition entirely.
+    requirements = job_input.get("requirements")
+    if requirements is not None and "prompt" not in params:
+        composed, error = compose_prompt(requirements)
+        if error:
+            return None, error
+        params["prompt"] = composed
+        params["composed_prompt"] = composed
+
+    suffix = job_input.get("prompt_suffix")
+    if suffix is not None and "prompt" in params:
+        if not isinstance(suffix, str):
+            return None, "'prompt_suffix' must be a string"
+        if suffix.strip():
+            params["prompt"] = params["prompt"].rstrip() + " " + suffix.strip()
+            if "composed_prompt" in params:
+                params["composed_prompt"] = params["prompt"]
+
     # A prompt is required unless the caller supplied a complete workflow that
     # already carries its own prompt text.
     if "prompt" not in params and params["workflow"] is None:
-        return None, "Missing 'prompt' parameter"
+        return None, "Missing 'prompt' or 'requirements' parameter"
+
+    fmt = job_input.get("output_format")
+    if fmt is not None:
+        if not isinstance(fmt, str) or fmt.lower() not in ("png", "webp", "jpeg"):
+            return None, "'output_format' must be one of: png, webp, jpeg"
+        params["output_format"] = fmt.lower()
 
     seed = job_input.get("seed")
     if seed is not None:
@@ -431,10 +520,49 @@ def handler(job):
 
     result = worker_comfyui_handler.handler(delegated_job)
 
-    # Echo the effective seed so a randomly chosen one can be reused.
     if isinstance(result, dict) and "error" not in result:
+        # Echo the effective seed so a randomly chosen one can be reused, and
+        # the composed prompt so the caller can see what was actually sent.
         result["seed"] = params["seed"]
+        if "composed_prompt" in params:
+            result["prompt"] = params["composed_prompt"]
+        if params.get("output_format", "png") != "png":
+            _recode_images(result, params["output_format"])
     return result
+
+
+def _recode_images(result, fmt):
+    """Re-encode returned base64 PNGs to a smaller format, in place.
+
+    ComfyUI's SaveImage only writes PNG, and a 1024x1024 PNG is ~1 MB once
+    base64-encoded. WEBP typically cuts that several-fold, which is worth real
+    milliseconds on the response leg. Failures are non-fatal: the PNG is kept.
+    """
+    images = result.get("images")
+    if not isinstance(images, list):
+        return
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001 - Pillow missing should never lose a result
+        return
+
+    pil_fmt = "WEBP" if fmt == "webp" else "JPEG"
+    for image in images:
+        if not isinstance(image, dict) or image.get("type") != "base64":
+            continue
+        try:
+            raw = base64.b64decode(image["data"])
+            img = Image.open(io.BytesIO(raw))
+            if pil_fmt == "JPEG" and img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, pil_fmt, quality=92, method=4) if pil_fmt == "WEBP" \
+                else img.save(buf, pil_fmt, quality=92)
+            image["data"] = base64.b64encode(buf.getvalue()).decode("utf-8")
+            image["filename"] = os.path.splitext(image.get("filename", "image"))[0] \
+                + ("." + fmt)
+        except Exception as exc:  # noqa: BLE001
+            print("handler - could not re-encode image to %s: %s" % (fmt, exc))
 
 
 if __name__ == "__main__":
