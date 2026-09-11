@@ -169,6 +169,18 @@ os.chdir(COMFY_DIR)
 sys.path.insert(0, COMFY_DIR)
 sys.argv = ["main.py", "--cpu"]
 
+# ComfyUI only reads sys.argv when main.py has switched parsing on; importing
+# `nodes` directly otherwise gets parse_args([]) and silently drops --cpu. That
+# leaves model_management initialising CUDA, which fails on a CPU-only build
+# machine ("Found no NVIDIA driver") and aborts validation before it can check
+# a single node class. Turn parsing on so --cpu is honoured.
+try:
+    import comfy.options
+
+    comfy.options.enable_args_parsing()
+except Exception:  # noqa: BLE001 - older layouts simply lack this module
+    pass
+
 say()
 say("--- comfyui ---")
 try:
