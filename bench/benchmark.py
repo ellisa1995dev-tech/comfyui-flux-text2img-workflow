@@ -135,7 +135,9 @@ def build_plan(args):
         return plan, step_plan
 
     chosen = PROMPTS if args.runs <= 0 else PROMPTS[:args.runs]
-    return list(chosen), [args.steps] * len(chosen)
+    offset = getattr(args, "seed_offset", 0) or 0
+    return ([(cat, prompt, seed + offset) for cat, prompt, seed in chosen],
+            [args.steps] * len(chosen))
 
 
 def fit_step_cost(rows):
@@ -394,6 +396,12 @@ def main():
     ap.add_argument("--height", type=int, default=None, help="output height (multiple of 8)")
     ap.add_argument("--output-format", choices=("png", "webp", "jpeg"), default=None,
                     dest="output_format", help="ask the handler to re-encode the image")
+    ap.add_argument("--seed-offset", type=int, default=0, dest="seed_offset",
+                    help="shift every seed by N. Re-running the same suite on a "
+                         "warm worker otherwise replays ComfyUI's node cache and "
+                         "measures cache lookups instead of generation. Use a "
+                         "different offset per configuration when comparing latency; "
+                         "keep 0 when comparing images across models.")
     ap.add_argument("--delivery", choices=("inline", "url"), default=None,
                     help="inline: image returned as base64 in the response. "
                          "url: uploaded to object storage, response carries a link. "
@@ -423,6 +431,8 @@ def main():
                              if args.width and args.height else "workflow default"))
     print("format   : %s" % (args.output_format or "handler default"))
     print("delivery : %s" % (args.delivery or "endpoint default"))
+    print("seeds    : %s" % ("base" if not args.seed_offset
+                             else "base+%d" % args.seed_offset))
     print("conn     : %s" % ("new per call" if args.no_reuse else "keep-alive"))
     print("steps    : %s" % (args.steps if args.steps is not None else
                              ("sweep %s" % (STEP_SWEEP,) if args.mode == "latency"
@@ -526,6 +536,25 @@ def main():
     elif warm_workers:
         print()
         print("  all warm runs on one worker: %s" % str(next(iter(warm_workers)))[:18])
+
+    # ComfyUI caches node outputs. Re-running the same prompts and seeds on a
+    # warm worker replays that cache: execution collapses and the numbers look
+    # spectacular while nothing was generated.
+    steps_seen = {r.get("steps_requested") for r in warm if r.get("steps_requested")}
+    if warm and len(steps_seen) == 1:
+        steps_val = steps_seen.pop()
+        mean_exec = statistics.fmean(r["exec_s"] for r in warm)
+        floor = max(0.6, 0.30 * steps_val)
+        if mean_exec < floor:
+            print()
+            print("  *** EXECUTION TOO FAST FOR %d STEPS - LIKELY CACHE HITS ***"
+                  % steps_val)
+            print("      warm execution averaged %.2f s (%.2f s/step)."
+                  % (mean_exec, mean_exec / steps_val))
+            print("      ComfyUI returns cached node outputs when the same prompt,")
+            print("      seed and graph are submitted again to a warm worker, so this")
+            print("      measures cache lookups rather than generation.")
+            print("      Re-run with --seed-offset (e.g. --seed-offset 100000).")
 
     print()
     print("  EFFECTIVE SAMPLER SETTINGS")
