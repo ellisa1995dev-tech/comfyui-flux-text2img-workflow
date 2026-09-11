@@ -23,10 +23,16 @@ ARG KLEIN_VAE_URL="https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-k
 # Re-assert the base image's pins in case any later step disturbs them.
 RUN uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
 
-# download models into comfyui (same retry/backoff shape as the production image)
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_UNET_URL" --relative-path models/unet --filename 'flux-2-klein-4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_TE_URL" --relative-path models/text_encoders --filename 'qwen_3_4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_VAE_URL" --relative-path models/vae --filename 'flux2-vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+# Download models. Hugging Face rate-limits anonymous downloads per source IP,
+# and RunPod's shared build machines get throttled: a build can see HTTP 429
+# rejected instantly on every attempt for several minutes. The backoff is
+# therefore long (60/120/300/600s ~= 18 min total) rather than the ~2 min the
+# production image uses -- waiting is far cheaper than a failed 37 GB build.
+# No mirror is used as a fallback: the only other copies of this model are
+# bf16 (7.75 GB), which would silently change both precision and image size.
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_UNET_URL" --relative-path models/unet --filename 'flux-2-klein-4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_TE_URL" --relative-path models/text_encoders --filename 'qwen_3_4b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN_VAE_URL" --relative-path models/vae --filename 'flux2-vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 
 # serverless wiring - identical to production: start.sh already boots ComfyUI
 # and then runs `python -u /handler.py`, so no CMD/ENTRYPOINT override.
