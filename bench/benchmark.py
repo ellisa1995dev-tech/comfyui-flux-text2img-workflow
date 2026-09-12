@@ -295,6 +295,47 @@ def http_error_message(e):
     return "\n".join(lines)
 
 
+def _finish(job, job_id, started, submit_s, final_s, polls, transport):
+    """Build the result row for a settled job (shared by poll and sync paths)."""
+    wall = time.monotonic() - started
+    out = job.get("output") or {}
+    server_s = (job.get("delayTime") or 0) / 1000.0 + \
+               (job.get("executionTime") or 0) / 1000.0
+    status = job.get("status")
+    if status != "COMPLETED":
+        details = out.get("details") or out.get("errors")
+        if isinstance(details, str):
+            details = [details]
+        return {"ok": False, "id": job_id, "status": status,
+                "worker": job.get("workerId"), "transport": transport,
+                "error": job.get("error") or "job %s" % status,
+                "details": details or []}
+    return {
+        "ok": True,
+        "id": job_id,
+        "status": status,
+        "worker": job.get("workerId"),
+        "transport": transport,
+        "delay_s": (job.get("delayTime") or 0) / 1000.0,
+        "exec_s": (job.get("executionTime") or 0) / 1000.0,
+        "wall_s": wall,
+        "submit_s": submit_s,
+        "final_poll_s": final_s,
+        "payload_bytes": getattr(api, "last_bytes", 0),
+        "polls": polls,
+        # Everything unaccounted for: detection lag plus RunPod's own lag
+        # between finishing and reporting COMPLETED. Near zero for /runsync,
+        # which returns the moment the job settles.
+        "detect_s": max(0.0, wall - server_s - submit_s - final_s),
+        "images": out.get("images") or [],
+        "seed_used": out.get("seed"),
+        "effective": out.get("effective") or {},
+        "encode_s": (out.get("timings") or {}).get("encode_s"),
+        "upload_s": (out.get("delivery") or {}).get("upload_s"),
+        "delivery_mode": (out.get("delivery") or {}).get("mode") or "inline",
+    }
+
+
 def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
     """Submit one job and poll until it settles. Returns a result dict.
 
@@ -312,11 +353,25 @@ def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
     reuse = opts.get("reuse", True)
 
     started = time.monotonic()
-    submitted = api(base + "/run", key, body, reuse=reuse)
-    submit_s = api.last_elapsed
-    job_id = submitted.get("id")
-    if not job_id:
-        return {"ok": False, "error": "no job id returned: %s" % submitted}
+
+    if opts.get("sync"):
+        # /runsync returns the finished job on the same connection: one round
+        # trip instead of submit + repeated polls. Removes the detection lag
+        # and the extra request that carries the payload.
+        job = api(base + "/runsync", key, body, timeout=timeout, reuse=reuse)
+        submit_s = api.last_elapsed
+        job_id = job.get("id")
+        if job.get("status") in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+            return _finish(job, job_id, started, submit_s, submit_s, 1, "sync")
+        # RunPod falls back to async when a job outruns its sync window.
+        if not job_id:
+            return {"ok": False, "error": "runsync returned no job: %s" % job}
+    else:
+        submitted = api(base + "/run", key, body, reuse=reuse)
+        submit_s = api.last_elapsed
+        job_id = submitted.get("id")
+        if not job_id:
+            return {"ok": False, "error": "no job id returned: %s" % submitted}
 
     deadline = started + timeout
     polls = 0
@@ -327,38 +382,8 @@ def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
         status = job.get("status")
 
         if status == "COMPLETED":
-            wall = time.monotonic() - started
-            images = (job.get("output") or {}).get("images") or []
-            # The final poll both detects completion and downloads the image;
-            # its elapsed time is dominated by the payload, not by detection.
-            final_s = getattr(api, "last_elapsed", 0.0)
-            payload_bytes = getattr(api, "last_bytes", 0)
-            server_s = (job.get("delayTime") or 0) / 1000.0 + \
-                       (job.get("executionTime") or 0) / 1000.0
-            return {
-                "ok": True,
-                "id": job_id,
-                "status": status,
-                "worker": job.get("workerId"),
-                "delay_s": (job.get("delayTime") or 0) / 1000.0,
-                "exec_s": (job.get("executionTime") or 0) / 1000.0,
-                "wall_s": wall,
-                "submit_s": submit_s,
-                "final_poll_s": final_s,
-                "payload_bytes": payload_bytes,
-                "polls": polls,
-                # Everything unaccounted for: detection lag plus RunPod's own
-                # lag between finishing and reporting COMPLETED.
-                "detect_s": max(0.0, wall - server_s - submit_s - final_s),
-                "images": images,
-                "seed_used": (job.get("output") or {}).get("seed"),
-                "effective": (job.get("output") or {}).get("effective") or {},
-                # Server-side stage timings reported by the handler.
-                "encode_s": ((job.get("output") or {}).get("timings") or {}).get("encode_s"),
-                "upload_s": ((job.get("output") or {}).get("delivery") or {}).get("upload_s"),
-                "delivery_mode": ((job.get("output") or {}).get("delivery") or {}).get("mode")
-                                 or "inline",
-            }
+            return _finish(job, job_id, started, submit_s,
+                           getattr(api, "last_elapsed", 0.0), polls, "poll")
 
         if status not in ("IN_QUEUE", "IN_PROGRESS"):
             # "Job processing failed" is the stock worker's generic headline;
@@ -443,6 +468,10 @@ def main():
                     help="inline: image returned as base64 in the response. "
                          "url: uploaded to object storage, response carries a link. "
                          "Omit to let the endpoint's own configuration decide.")
+    ap.add_argument("--sync", action="store_true",
+                    help="use POST /runsync (one round trip) instead of /run plus "
+                         "polling. Removes the completion-detection lag; falls "
+                         "back to polling if a job outruns RunPod's sync window.")
     ap.add_argument("--no-reuse", action="store_true",
                     help="open a new TLS connection per call (measures keep-alive benefit)")
     args = ap.parse_args()
@@ -471,6 +500,8 @@ def main():
     print("seeds    : %s" % ("base" if not args.seed_offset
                              else "base+%d" % args.seed_offset))
     print("conn     : %s" % ("new per call" if args.no_reuse else "keep-alive"))
+    print("transport: %s" % ("/runsync (one round trip)" if args.sync
+                             else "/run + poll"))
     print("steps    : %s" % (args.steps if args.steps is not None else
                              ("sweep %s" % (STEP_SWEEP,) if args.mode == "latency"
                               else "workflow default")))
@@ -487,6 +518,7 @@ def main():
                     opts={"width": args.width, "height": args.height,
                           "output_format": args.output_format,
                           "delivery": args.delivery,
+                          "sync": args.sync,
                           "reuse": not args.no_reuse})
         r["run"] = i + 1
         r["category"] = category
@@ -684,6 +716,9 @@ def main():
         # Server-side stages the handler reports, plus the client fetch.
         modes = {r.get("delivery_mode") for r in warm}
         print("    delivery mode           %s" % ", ".join(sorted(str(m) for m in modes)))
+        tr = {r.get("transport") for r in warm if r.get("transport")}
+        if tr:
+            print("    transport               %s" % ", ".join(sorted(tr)))
         for field, lbl in (("encode_s", "WebP encode (server)"),
                            ("upload_s", "object-storage upload"),
                            ("download_s", "client download")):
