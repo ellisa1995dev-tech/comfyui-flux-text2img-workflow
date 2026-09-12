@@ -103,15 +103,17 @@ so a typo fails loudly instead of silently dropping a requirement.
 `output_format` defaults to `webp` for URL delivery and `png` for inline.
 **WebP here is lossless** — pixel-identical to the PNG, about 32% smaller.
 
-**Which delivery mode to use.** `url` measured faster end-to-end (4.81 s vs
-6.07 s), but see the caveat under [Timing](#timing) — that comparison is not yet
-conclusive. The architectural question matters more than the milliseconds: if
-your backend stores images in its own bucket anyway, `inline` hands you the
+**Which delivery mode to use: `inline`.** It measured **~2.0 s faster**
+end-to-end (6.65 s vs 8.62 s) — see [Timing](#timing). The architecture agrees:
+if your backend stores images in its own bucket anyway, `inline` hands you the
 bytes in one step, whereas `url` means RunPod uploads, you download, then you
-re-store. `url` earns its place if you serve the presigned link onward — note
-those links expire after 7 days and sit outside your CDN and access control.
-Either way, **branch on `images[].type`** and switching later is configuration,
-not code.
+re-store. `url` earns its place only if you serve the presigned link straight to
+clients — and those links expire after 7 days, outside your CDN and access
+control.
+
+The one case worth re-measuring: a backend running in the **same region as the
+bucket**, where the 2.00 s client download would largely vanish. Either way,
+**branch on `images[].type`** so switching stays a configuration change.
 
 ### Advanced
 
@@ -255,27 +257,32 @@ Measured, 4 steps, 1024×1024, lossless WebP, 9 warm runs per configuration.
 
 | Stage | `delivery: "inline"` | `delivery: "url"` (S3) |
 | --- | --- | --- |
-| Queue / worker pickup | 0.09 s | 0.24 s |
-| ComfyUI execution | 4.53 s | 3.74 s |
-| — of which image encode | 0.76 s | 0.44 s |
-| — of which S3 upload | — | 0.43 s |
-| API response | 6.07 s | 4.54 s |
-| Client download | — | 0.27 s |
-| **Image in hand** | **6.07 s** | **4.81 s** |
-| Image size | 1.09 MB | 1.01 MB |
+| Queue / worker pickup | 0.13 s | 0.09 s |
+| ComfyUI execution | 4.46 s | 6.14 s |
+| — of which image encode | 0.73 s | 0.75 s |
+| — of which S3 upload | — | 1.78 s |
+| — **pure generation** | **3.73 s** | **3.62 s** |
+| API leg (submit + poll + transfer) | 2.06 s | 0.38 s |
+| Response payload | 1.41 MB | 871 bytes |
+| Client download | — | 2.00 s |
+| **Image in hand** | **6.65 s** | **8.62 s** |
 
-Cold start (first request after idle): **~31 s** — 15.9 s worker pickup plus
-12.9 s loading ~12.5 GB of weights into VRAM.
+Cold start (first request after idle): **~27–31 s** — worker pickup plus ~13 s
+loading ~12.5 GB of weights into VRAM.
 
-> **The inline-vs-S3 difference is provisional.** The two runs landed on
-> *different workers* (`cqwvhhlwcprrtu` and `gf58qnb2vv6z58`), so GPU speed is
-> confounded with delivery mode. Execution differs by 0.79 s even though
-> generation should not depend on delivery at all — and the S3 run did *more*
-> work inside `exec` (encode + upload = 0.87 s vs 0.76 s) while still finishing
-> faster, which means its worker is simply quicker. Somewhere between 0.4 s and
-> 1.3 s of the 1.26 s gap may be hardware rather than transport. Treat S3 as
-> *likely* faster, not proven, until both configurations are measured
-> back-to-back on the same worker.
+**Inline is faster by ~2.0 s.** Moving the image out of the API response does
+save 1.68 s on the API leg (2.06 → 0.38 s), but S3 charges 1.78 s of upload
+inside `executionTime` plus 2.00 s of client download to do it — a net loss.
+
+> The two runs used different workers, but the comparison holds: with encode and
+> upload subtracted, **pure generation matched within 2.8%** (3.73 s vs 3.62 s),
+> so hardware is not driving the difference.
+
+> **The download figure is location-dependent.** It was measured from a UK client
+> against a `us-east-1` bucket, and S3 transfer for the same ~1 MB image has
+> ranged from **0.27 s to 2.00 s** across sessions. A backend co-located with the
+> bucket would see far less, which could close or reverse the gap. If your
+> backend runs in the same region as the bucket, re-measure before ruling S3 out.
 
 **Design the UX around ~6 seconds, and ~31 s for a cold first request.** This is
 not a request a user can wait on synchronously. Submit, return a job id
