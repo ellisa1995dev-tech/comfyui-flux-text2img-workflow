@@ -520,8 +520,12 @@ def build_workflow(params):
 # by runpod.serverless.utils.rp_upload -- not a new convention. Credentials
 # come from the environment only: never from the request, never baked into the
 # image, never logged or echoed in a response.
+# BUCKET_NAME is required, not optional: rp_upload falls back to
+# time.strftime("%m-%y") when no bucket is given, which is a name like "09-26"
+# that will not exist. Demanding it up front turns a confusing mid-job
+# NoSuchBucket into a clear pre-flight error.
 S3_REQUIRED_ENV = ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID",
-                   "BUCKET_SECRET_ACCESS_KEY")
+                   "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME")
 
 
 def _s3_missing_env():
@@ -643,9 +647,13 @@ def handler(job):
     }
 
     delivery = params.get("delivery", "inline")
-    # For URL delivery this handler owns the encoding, so the stock worker's
-    # own upload is suppressed for the duration of the delegated call.
-    with _stock_upload_suppressed(delivery == "url"):
+    # Always suppress the stock worker's own S3 upload. It calls
+    # rp_upload.upload_image() without a bucket name, which falls back to
+    # time.strftime("%m-%y") -- a bucket like "09-26" that does not exist, so
+    # every job fails with NoSuchBucket the moment BUCKET_ENDPOINT_URL is set.
+    # It would also upload PNG, bypassing the encoding chosen here. This
+    # handler owns delivery in both modes.
+    with _stock_upload_suppressed(True):
         result = worker_comfyui_handler.handler(delegated_job)
 
     if isinstance(result, dict) and "error" not in result:

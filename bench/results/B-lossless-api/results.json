@@ -1,0 +1,167 @@
+{
+  "label": "B-lossless-api",
+  "endpoint": "esfw98h9oa1g3b",
+  "steps": 4,
+  "runs": [
+    {
+      "ok": false,
+      "id": "f0b483bc-19ea-4ffa-9a0d-76c0f63523f6-e2",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00001_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 1,
+      "category": "portrait",
+      "prompt": "close-up portrait of a 25-year-old woman, green eyes, dark brown hair, soft smile, cozy bedroom, natural window light",
+      "seed": 101111,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "4ffb93f5-8597-47ca-a744-1c7351263766-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00002_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 2,
+      "category": "full-body",
+      "prompt": "full-body photograph of a woman in a long grey wool coat and boots, standing on a city street, entire figure visible head to toe",
+      "seed": 102222,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "0edac1ea-2e06-4ed4-a7a1-88b0db99a1e1-e2",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00003_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 3,
+      "category": "complex-background",
+      "prompt": "a woman reading at a cafe table, busy street market behind her with stalls, pedestrians, bicycles and hanging signs",
+      "seed": 103333,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "1f47d5f8-55b8-4de1-87f7-5548c58b7968-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00004_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 4,
+      "category": "multiple-objects",
+      "prompt": "exactly five ripe lemons and three green pears arranged on a wooden table beside a blue ceramic jug",
+      "seed": 104444,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "393a5f26-4b2f-406e-88fd-d5766d173183-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00005_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 5,
+      "category": "difficult-composition",
+      "prompt": "low-angle wide shot of a spiral staircase seen from directly below, strong perspective, symmetrical framing",
+      "seed": 105555,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "980463bc-3286-4fc3-8aac-6fd214a87b47-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00006_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 6,
+      "category": "facial-detail",
+      "prompt": "extreme close-up of an elderly man's face, deep wrinkles, visible skin pores, individual eyelashes, catchlight in both eyes",
+      "seed": 106666,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "520597ba-27dd-4c8b-a8c1-602ea49ef7e4-e2",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00007_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 7,
+      "category": "hands",
+      "prompt": "close-up of two hands carefully tying a shoelace, all ten fingers clearly visible and correctly formed",
+      "seed": 107777,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "259f183b-5e2d-4d51-a37e-f54a38cd90a3-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00008_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 8,
+      "category": "clothing-detail",
+      "prompt": "detailed studio shot of an embroidered silk jacket on a mannequin, visible stitching, buttons and fabric weave",
+      "seed": 108888,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "3a3e53dc-f4fd-41b8-be9c-74ee05755f64-e1",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00009_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 9,
+      "category": "lighting",
+      "prompt": "portrait lit by a single candle in a dark room, strong chiaroscuro, warm falloff, deep shadows",
+      "seed": 109999,
+      "steps_requested": 4
+    },
+    {
+      "ok": false,
+      "id": "e2d2d1ab-e097-418e-b65f-80e5c1d224b0-e2",
+      "status": "FAILED",
+      "worker": "ilpphv6qjztaxk",
+      "error": "Job processing failed",
+      "details": [
+        "Error uploading klein4b_00010_.png to S3: An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist"
+      ],
+      "run": 10,
+      "category": "long-prompt",
+      "prompt": "editorial photograph of a 30-year-old woman with shoulder-length auburn hair and freckles, wearing a tailored charcoal blazer over a cream silk blouse, standing three-quarter turned toward camera in a sunlit mid-century apartment, one hand resting on a walnut chair, warm late-afternoon light from a tall window on the left, shallow depth of field, 85mm lens, muted earth-tone palette, calm confident expression",
+      "seed": 112345,
+      "steps_requested": 4
+    }
+  ],
+  "cold": {
+    "delay_s": null,
+    "exec_s": null,
+    "wall_s": null
+  },
+  "warm": {
+    "delay_s": null,
+    "exec_s": null,
+    "wall_s": null
+  }
+}
