@@ -103,6 +103,16 @@ so a typo fails loudly instead of silently dropping a requirement.
 `output_format` defaults to `webp` for URL delivery and `png` for inline.
 **WebP here is lossless** — pixel-identical to the PNG, about 32% smaller.
 
+**Which delivery mode to use.** `url` measured faster end-to-end (4.81 s vs
+6.07 s), but see the caveat under [Timing](#timing) — that comparison is not yet
+conclusive. The architectural question matters more than the milliseconds: if
+your backend stores images in its own bucket anyway, `inline` hands you the
+bytes in one step, whereas `url` means RunPod uploads, you download, then you
+re-store. `url` earns its place if you serve the presigned link onward — note
+those links expire after 7 days and sit outside your CDN and access control.
+Either way, **branch on `images[].type`** and switching later is configuration,
+not code.
+
 ### Advanced
 
 | Field | Type | Notes |
@@ -241,30 +251,40 @@ awkward to cache.
 
 ## Timing
 
-Measured on a warm worker, 4 steps, 1024×1024.
+Measured, 4 steps, 1024×1024, lossless WebP, 9 warm runs per configuration.
 
-| Stage | Warm |
-| --- | --- |
-| Queue / worker pickup | 0.13 s |
-| ComfyUI execution | ~3.7 s |
-| API leg (submit + poll + transfer) | 1.4–2.2 s |
-| **End-to-end** | **5.5–6.0 s** |
+| Stage | `delivery: "inline"` | `delivery: "url"` (S3) |
+| --- | --- | --- |
+| Queue / worker pickup | 0.09 s | 0.24 s |
+| ComfyUI execution | 4.53 s | 3.74 s |
+| — of which image encode | 0.76 s | 0.44 s |
+| — of which S3 upload | — | 0.43 s |
+| API response | 6.07 s | 4.54 s |
+| Client download | — | 0.27 s |
+| **Image in hand** | **6.07 s** | **4.81 s** |
+| Image size | 1.09 MB | 1.01 MB |
 
-Cold start (first request after idle): **~26 s** — 9.9 s worker pickup plus
-13.9 s loading ~12.5 GB of weights into VRAM.
+Cold start (first request after idle): **~31 s** — 15.9 s worker pickup plus
+12.9 s loading ~12.5 GB of weights into VRAM.
 
-The API leg varies with payload: lossless WebP (~1.2 MB) is faster than PNG
-(~1.5 MB). Roughly `0.74 s + 0.34 s/MB`, so there is a fixed ~1.3 s floor from
-RunPod's submit and poll round-trips that no payload change removes.
+> **The inline-vs-S3 difference is provisional.** The two runs landed on
+> *different workers* (`cqwvhhlwcprrtu` and `gf58qnb2vv6z58`), so GPU speed is
+> confounded with delivery mode. Execution differs by 0.79 s even though
+> generation should not depend on delivery at all — and the S3 run did *more*
+> work inside `exec` (encode + upload = 0.87 s vs 0.76 s) while still finishing
+> faster, which means its worker is simply quicker. Somewhere between 0.4 s and
+> 1.3 s of the 1.26 s gap may be hardware rather than transport. Treat S3 as
+> *likely* faster, not proven, until both configurations are measured
+> back-to-back on the same worker.
 
-**Design the UX around ~6 seconds, and ~26 s for a cold first request.** This is
+**Design the UX around ~6 seconds, and ~31 s for a cold first request.** This is
 not a request a user can wait on synchronously. Submit, return a job id
 immediately, deliver the image when it lands. Use `/run` + poll, not `/runsync`,
 whose long held-open connection invites gateway timeouts on a cold start.
 
-> Timings were measured before the most recent image rebuild. The generation
-> path (model, 4 steps, 1024×1024) is unchanged; encoding and delivery options
-> were added since, so the API-leg figure will shift with `output_format`.
+There is a fixed floor of roughly 1.3 s in the API leg from RunPod's submit and
+poll round-trips, independent of payload size; moving the image out of the
+response cannot remove it.
 
 ---
 
