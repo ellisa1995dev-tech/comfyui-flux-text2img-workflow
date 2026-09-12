@@ -12,11 +12,14 @@ image** using **FLUX.2 [klein] 4B** on ComfyUI.
 | **Content type** | `application/json` |
 | **Model** | FLUX.2 [klein] 4B (fp8), Qwen3-4B text encoder |
 | **Sampling** | 4 steps, CFG 1.0, euler / simple |
-| **Output** | 1024×1024, base64 image — or an object-storage URL |
+| **Output** | 1024×1024 PNG, base64 in the response |
+| **Warm latency** | **~4.1 s** end-to-end (measured; see [Timing](#timing)) |
+| **Cold start** | ~26 s |
+| **Licence** | Apache-2.0 — commercial use permitted |
 
 > **Credentials.** The endpoint ID and API key are **not** in this repo. Get the
 > endpoint ID from the RunPod console; create an API key under **RunPod →
-> Settings → API Keys** and give it to the service as an environment variable
+> Settings → API Keys** and supply it to the service as an environment variable
 > (`RUNPOD_API_KEY`) from your secret store. Never commit it, never send it over
 > chat or email.
 
@@ -26,28 +29,59 @@ image** using **FLUX.2 [klein] 4B** on ComfyUI.
 
 ---
 
-## Endpoints
+## 1. Recommended configuration
 
-| Route | Purpose |
+Start here. The rest of the document is reference.
+
+```jsonc
+POST /run
+{
+  "input": {
+    "prompt": "close-up portrait of a 25-year-old woman, green eyes, soft smile",
+    "seed": 12345
+    // no output_format  -> PNG, ComfyUI's native output, no re-encode
+    // no delivery       -> inline base64
+  }
+}
+```
+
+Then poll `GET /status/{id}` until the status settles.
+
+| Choice | Why |
 | --- | --- |
-| `POST /run` | Submit a job, returns immediately with an id. **Use this in production.** |
-| `GET /status/{id}` | Poll a job's state and collect its output. |
-| `POST /runsync` | Submit and wait. Manual testing only — see [Timing](#timing). |
-| `POST /cancel/{id}` | Cancel a queued or running job. |
-| `GET /health` | Worker and queue health. |
+| **PNG** (omit `output_format`) | ComfyUI writes PNG natively. Asking for lossless WebP costs **0.73 s** of re-encode to save ~0.4 MB — a net loss. Both are lossless; PNG is simply free. |
+| **Inline** (omit `delivery`) | Measured **~2 s faster** than S3 URLs, and your backend stores the image in its own bucket anyway. |
+| **`/run` + poll** | `/runsync` measured only **0.08 s** faster — inside the noise. Polling avoids long-held connections and needs one code path, not two. |
+| **4 steps** | **Do not change.** See [Quality](#quality). |
 
 ---
 
-## Request
+## 2. Endpoints
 
-Two ways to describe the image. Use **one** of `prompt` or `requirements`.
+| Route | Purpose |
+| --- | --- |
+| `POST /run` | Submit a job, returns immediately with an id. **Use this.** |
+| `GET /status/{id}` | Poll a job's state and collect its output. |
+| `POST /runsync` | Submit and wait in one round trip. See the note below. |
+| `POST /cancel/{id}` | Cancel a queued or running job. |
+| `GET /health` | Worker and queue health. |
+
+> **On `/runsync`:** it works and is marginally faster, but RunPod falls back to
+> async when a job outruns its sync window — so you must implement polling
+> anyway. Given that, `/run` + poll is one code path instead of two, for 0.08 s.
+
+---
+
+## 3. Request
+
+Use **one** of `prompt` or `requirements`.
 
 ### Simple: a prompt
 
 ```json
 {
   "input": {
-    "prompt": "close-up portrait of a 25-year-old woman, green eyes, soft smile, natural window light",
+    "prompt": "close-up portrait of a 25-year-old woman, green eyes, dark brown hair, soft smile, natural window light",
     "seed": 12345
   }
 }
@@ -82,9 +116,9 @@ text encoder is an LLM and reads prose better than comma-separated tags.
 }
 ```
 
-The composed prompt is returned in the response, so you can log exactly what was
-sent to the model. An unknown field is **rejected with the list of valid ones**,
-so a typo fails loudly instead of silently dropping a requirement.
+The composed prompt is returned in `output.prompt`, so you can log exactly what
+reached the model. An unknown field is **rejected with the list of valid ones**,
+so a typo fails loudly rather than silently dropping a requirement.
 
 ### All fields
 
@@ -96,24 +130,9 @@ so a typo fails loudly instead of silently dropping a requirement.
 | `seed` | integer | random | `0`–`1125899906842624`. Negative rejected; larger values wrap. Always echoed back. |
 | `width` | integer | `1024` | `64`–`2048`, multiple of 8. |
 | `height` | integer | `1024` | `64`–`2048`, multiple of 8. |
-| `steps` | integer | `4` | `1`–`100`. **Leave at 4** — see [Quality](#quality). |
-| `output_format` | string | see below | `png`, `webp` (lossless), or `jpeg`. |
-| `delivery` | string | auto | `inline` (base64 in the response) or `url` (object storage). |
-
-`output_format` defaults to `webp` for URL delivery and `png` for inline.
-**WebP here is lossless** — pixel-identical to the PNG, about 32% smaller.
-
-**Which delivery mode to use: `inline`.** It measured **~2.0 s faster**
-end-to-end (6.65 s vs 8.62 s) — see [Timing](#timing). The architecture agrees:
-if your backend stores images in its own bucket anyway, `inline` hands you the
-bytes in one step, whereas `url` means RunPod uploads, you download, then you
-re-store. `url` earns its place only if you serve the presigned link straight to
-clients — and those links expire after 7 days, outside your CDN and access
-control.
-
-The one case worth re-measuring: a backend running in the **same region as the
-bucket**, where the 2.00 s client download would largely vanish. Either way,
-**branch on `images[].type`** so switching stays a configuration change.
+| `steps` | integer | `4` | `1`–`100`. **Leave at 4.** |
+| `output_format` | string | `png` | `png`, `webp` (lossless), `jpeg`. Leave unset. |
+| `delivery` | string | auto | `inline` or `url`. Leave unset unless storage is configured. |
 
 ### Advanced
 
@@ -122,45 +141,48 @@ bucket**, where the 2.00 s client download would largely vanish. Either way,
 | `workflow` | object | A complete ComfyUI API-format graph, submitted as sent. Fields above are applied on top. |
 | `images` | array | Input images as `{"name", "image"}` (base64), for graphs that consume them. |
 
+**Validation runs before any GPU work**, so a malformed request fails in
+milliseconds and costs nothing.
+
 ---
 
-## Response
+## 4. Response
 
 ### Completed
 
 ```json
 {
-  "id": "cade7f83-dab9-4d5e-8cb9-77aaf9abd145-e2",
+  "id": "6e21437c-76eb-48b1-95e2-be5d170e1aa8-e1",
   "status": "COMPLETED",
   "delayTime": 130,
-  "executionTime": 3650,
-  "workerId": "45iijguoudetkf",
+  "executionTime": 1960,
+  "workerId": "w75gl0kmglualq",
   "output": {
     "images": [
-      { "filename": "klein4b_00001_.webp", "type": "base64", "data": "UklGR..." }
+      { "filename": "klein4b_00001_.png", "type": "base64", "data": "iVBORw0KGgo..." }
     ],
     "seed": 12345,
     "prompt": "a 25-year-old woman, green eyes, ... . editorial photography.",
     "effective": {
-      "steps": 4, "cfg": 1.0, "sampler_name": "euler",
-      "scheduler": "simple", "width": 1024, "height": 1024
+      "steps": 4, "cfg": 1, "sampler_name": "euler",
+      "scheduler": "simple", "width": 1024, "height": 1024, "batch_size": 1
     },
-    "timings": { "encode_s": 0.12 }
+    "timings": { "encode_s": 0.0 }
   }
 }
 ```
 
-`delayTime` and `executionTime` are milliseconds.
+`delayTime` and `executionTime` are **milliseconds**.
 
 | Key | Notes |
 | --- | --- |
 | `output.images[].type` | `base64` or `s3_url`. **Branch on this**, don't assume. |
-| `output.images[].data` | Raw base64 (no `data:` prefix) — or an https URL when `type` is `s3_url`. |
+| `output.images[].data` | Raw base64, no `data:` prefix — or an https URL when `type` is `s3_url`. |
+| `output.images[].filename` | e.g. `klein4b_00001_.png`. |
 | `output.seed` | The seed actually used. Replay it to reproduce the image exactly. |
 | `output.prompt` | The composed prompt, when `requirements` was used. |
-| `output.effective` | What the sampler actually ran. Useful for asserting config in staging. |
+| `output.effective` | What the sampler actually ran — useful for asserting config in staging. |
 | `output.timings` | Server-side stage timings (`encode_s`, `upload_s`). |
-| `output.delivery` | Present for URL delivery: `mode`, `upload_s`, `bytes`, `format`. |
 | `output.errors` | Partial success — image produced, but something also went wrong. Log it. |
 | `output.status` | Only ever `"success_no_images"`. Treat as a failure. |
 
@@ -168,7 +190,7 @@ bucket**, where the 2.00 s client download would largely vanish. Either way,
 
 ```json
 {
-  "id": "cade7f83-...",
+  "id": "6e21437c-...",
   "status": "FAILED",
   "error": "'width' must be a multiple of 8"
 }
@@ -177,30 +199,43 @@ bucket**, where the 2.00 s client download would largely vanish. Either way,
 **Branch on `status`, never on the presence of `output`.** On failure the
 message is at the **top level** as `error`. The SDK lifts it out of the returned
 object and drops `output` when nothing else remains, so a validation failure has
-**no** `output` key at all.
+**no `output` key at all**. A workflow that failed mid-run additionally carries
+`output.details` with per-step diagnostics — log those; they name the real cause.
 
 ### Decoding
 
 ```js
-// Node — inline
+// Node
 const buf = Buffer.from(job.output.images[0].data, "base64");
 ```
 
 ```python
-# Python — inline
+# Python
 buf = base64.b64decode(job["output"]["images"][0]["data"])
 ```
 
-For `type: "s3_url"`, `data` is a presigned https URL — fetch it directly, no
-auth header. Treat `images` as a list even though it holds one entry today.
+Treat `images` as a list even though it holds one entry today.
 
 ---
 
-## The integration flow
+## 5. Integration flow
+
+```
+Client                Your backend                    RunPod
+  │                        │                             │
+  ├─ POST /generate ──────▶│                             │
+  │   {requirements}       ├─ POST /run ────────────────▶│   (API key here only)
+  │                        │◀─ {id} ─────────────────────┤
+  │◀─ {job_id} ────────────┤                             │
+  │   (your id, not RunPod's)                            │
+  │                        ├─ poll /status/{id} ────────▶│
+  │                        │◀─ COMPLETED + base64 ───────┤
+  │                        ├─ decode, store in YOUR bucket
+  ├─ GET /jobs/{job_id} ──▶│
+  │◀─ {status, image_url} ─┤
+```
 
 ### 1. Submit
-
-`POST /run` returns immediately with an id and status `IN_QUEUE`.
 
 ```js
 const BASE = `https://api.runpod.ai/v2/${process.env.RUNPOD_ENDPOINT_ID}`;
@@ -218,10 +253,8 @@ const { id } = await res.json();
 
 ### 2. Poll until it settles
 
-Keep polling while `IN_QUEUE` or `IN_PROGRESS`; stop on anything else.
-
 ```js
-async function waitFor(id, { intervalMs = 500, timeoutMs = 300000 } = {}) {
+async function waitFor(id, { intervalMs = 250, timeoutMs = 120000 } = {}) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -241,104 +274,125 @@ async function waitFor(id, { intervalMs = 500, timeoutMs = 300000 } = {}) {
 ```
 
 **Use a keep-alive HTTP agent.** A fresh TLS handshake per poll measurably
-inflates latency — we measured it.
+inflates latency — we measured it. A 250 ms interval is a sensible default;
+polling faster does not speed up generation.
 
-### 3. Store the result, return a URL
+### 3. Store and return your own URL
 
-Decode into your own storage and hand the client a URL. Passing ~1.2 MB of
-base64 through your own API to the browser wastes bandwidth twice and is
-awkward to cache.
+Decode into your own bucket and hand the client a URL you control — lifecycle,
+CDN and access control all stay yours.
+
+### What your backend should own
+
+- **Its own job IDs.** Don't leak RunPod's; it keeps the client contract stable
+  if the provider ever changes.
+- **The state record:** job id, requirements, the returned `seed`, status, image
+  URL. The seed is what makes a result reproducible.
+- **Auth and rate limiting.** Every request costs GPU-seconds.
 
 ---
 
-## Timing
+## 6. Timing
 
-Measured, 4 steps, 1024×1024, lossless WebP, 9 warm runs per configuration.
+Measured on **RTX 4090**, 9 warm runs, 4 steps, 1024×1024, PNG inline.
 
-| Stage | `delivery: "inline"` | `delivery: "url"` (S3) |
+| Stage | Warm | Share |
 | --- | --- | --- |
-| Queue / worker pickup | 0.13 s | 0.09 s |
-| ComfyUI execution | 4.46 s | 6.14 s |
-| — of which image encode | 0.73 s | 0.75 s |
-| — of which S3 upload | — | 1.78 s |
-| — **pure generation** | **3.73 s** | **3.62 s** |
-| API leg (submit + poll + transfer) | 2.06 s | 0.38 s |
-| Response payload | 1.41 MB | 871 bytes |
-| Client download | — | 2.00 s |
-| **Image in hand** | **6.65 s** | **8.62 s** |
+| Queue / worker pickup | 0.13 s | 3% |
+| **ComfyUI execution (generation)** | **1.96 s** | 47% |
+| API leg (submit + poll + transfer) | 2.10 s | 50% |
+| **End-to-end** | **4.19 s** | |
 
-Cold start (first request after idle): **~27–31 s** — worker pickup plus ~13 s
-loading ~12.5 GB of weights into VRAM.
+Per-category execution ranged **1.55–2.44 s**; long prompts cost slightly more
+because text encoding scales with token count.
 
-**Inline is faster by ~2.0 s.** Moving the image out of the API response does
-save 1.68 s on the API leg (2.06 → 0.38 s), but S3 charges 1.78 s of upload
-inside `executionTime` plus 2.00 s of client download to do it — a net loss.
+Cold start (first request after idle): **~26 s** — ~12–16 s worker pickup plus
+~8–11 s loading ~12.5 GB of weights into VRAM.
 
-> The two runs used different workers, but the comparison holds: with encode and
-> upload subtracted, **pure generation matched within 2.8%** (3.73 s vs 3.62 s),
-> so hardware is not driving the difference.
+> **The API leg was measured from a UK client.** Your backend is in the US, much
+> closer to the workers, so **expect it to be materially lower** — the 2.10 s
+> includes transferring a ~2 MB response across the Atlantic. Measure it from
+> your own environment before quoting a latency figure; end-to-end under 4 s is
+> plausible for a US backend and was not achievable from the UK.
 
-> **The download figure is location-dependent.** It was measured from a UK client
-> against a `us-east-1` bucket, and S3 transfer for the same ~1 MB image has
-> ranged from **0.27 s to 2.00 s** across sessions. A backend co-located with the
-> bucket would see far less, which could close or reverse the gap. If your
-> backend runs in the same region as the bucket, re-measure before ruling S3 out.
-
-**Design the UX around ~6 seconds, and ~31 s for a cold first request.** This is
-not a request a user can wait on synchronously. Submit, return a job id
-immediately, deliver the image when it lands. Use `/run` + poll, not `/runsync`,
-whose long held-open connection invites gateway timeouts on a cold start.
-
-There is a fixed floor of roughly 1.3 s in the API leg from RunPod's submit and
-poll round-trips, independent of payload size; moving the image out of the
-response cannot remove it.
+`/runsync` measured 4.11 s versus 4.19 s for `/run` + poll — a 0.08 s
+difference, which is why this document recommends polling for simplicity.
 
 ---
 
-## Quality
+## 7. Concurrency and cost
 
-**Do not lower `steps` below 4.** The customer compared 2-step and 4-step output
-and chose 4: facial detail — moles, skin texture — is visibly better and less
-blurred. 4 steps is also Black Forest Labs' reference setting for this model.
+A worker handles **one job at a time**, and is occupied for `executionTime`
+(~1.96 s warm).
 
-There is no upscaler, face restoration, sharpening or second pass. The image you
-receive is what the model produced, and WebP output is lossless, so nothing
-alters the pixels after generation.
+**Workers needed ≈ arrival rate × generation time.**
+
+| Load | Workers |
+| --- | --- |
+| 1 request/s | ~2 |
+| 200 requests over 60 s | ~7 |
+| 2,500 images as a batch | 1 GPU ≈ 82 min; 5 GPUs ≈ 16 min; 10 GPUs ≈ 8 min |
+
+At $1.10/hr for an RTX 4090, that is **~$0.0006 per image** — 2,500 images for
+about **$1.50**.
+
+**Cold starts are the tail risk, not throughput.** A request arriving after idle
+waits ~26 s. Keep at least one active worker during traffic hours, and enable
+**FlashBoot** on the endpoint.
+
+For bulk generation, `batch_size` on the latent node amortises per-request fixed
+costs across several images — worth benchmarking if you have batch workloads.
 
 ---
 
-## Errors worth handling
+## 8. Errors worth handling
 
 | Symptom | Cause | Handling |
 | --- | --- | --- |
-| `401` | Missing or invalid API key | Configuration error — fail at startup, not per request. |
-| `FAILED` + `error` | Rejected input, or the workflow could not run | Log it. Input errors are deterministic; retrying will not help. |
-| `FAILED` + `delivery='url' requires object storage...` | Endpoint lacks `BUCKET_*` variables | Configuration, not code. Omit `delivery` to fall back to inline. |
+| `401` / `403` | Key missing, revoked, scoped to other endpoints, or wrong endpoint id | Configuration error — fail at startup, not per request. |
+| `FAILED` + `error` | Rejected input, or the workflow could not run | Log it, plus `output.details`. Input errors are deterministic; retrying will not help. |
+| `FAILED` + `delivery='url' requires object storage...` | Endpoint lacks `BUCKET_*` variables | Omit `delivery` to use inline. |
 | `TIMED_OUT` | Exceeded the endpoint's execution timeout | Safe to retry once. |
 | Long `IN_QUEUE` | Workers busy or scaling from zero | Expected. Keep polling; raise max workers if routine. |
 | `COMPLETED`, empty `images` | Workflow produced nothing (`output.status` = `success_no_images`) | Rare. Treat as a failure. |
 
 ---
 
-## Before you scale
+## 9. Quality
 
-- **Every request costs GPU-seconds.** Put authentication and a per-user rate
-  limit in front of the endpoint before it is reachable from the product.
-- **Concurrency:** one job per GPU. Workers ≈ arrival-rate × generation-time.
-  At ~3.7 s execution, 200 requests over 60 s needs roughly 14 workers.
-- **FlashBoot** on the endpoint cuts the ~26 s cold start substantially, at no
-  extra cost.
-- **Prompts are user input.** This endpoint applies no moderation.
-- **Licensing:** FLUX.2 [klein] 4B is **Apache-2.0** — commercial use permitted.
+**Do not lower `steps` below 4.** The customer compared 2-step and 4-step output
+and chose 4: facial detail — moles, skin texture — is visibly better and less
+blurred. 4 steps is also Black Forest Labs' reference setting for this model.
+
+**Do not change the resolution** from 1024×1024, or the sampler from
+`euler` / `simple` / CFG 1.0. Klein is a *distilled* model; raising CFG or steps
+fights the distillation rather than improving output.
+
+There is **no upscaler, face restoration, sharpening or second pass**. PNG
+output is lossless, so nothing alters the pixels after generation. If a request
+ever returns an image that looks softened, that is a generation result, not
+post-processing.
+
+Generation is **deterministic**: the same prompt and seed produce a
+byte-identical image.
 
 ---
 
-## Verification
+## 10. Verification
 
 Request and response shapes were verified against the deployed handler, the
 `runpod/worker-comfyui:5.10.0` handler it delegates to, and the RunPod SDK's
-job-result mapping. Timings come from repeated warm runs on a single worker;
-they vary with GPU type and queue depth.
+job-result mapping. Timings come from repeated warm runs on a single worker and
+vary with GPU type, region and queue depth.
 
-To assert configuration from your own integration tests, check `output.effective`
-— it reports what the sampler actually ran, independent of what was requested.
+To assert configuration from your own integration tests, check
+`output.effective` — it reports what the sampler actually ran, read back from
+the submitted graph, independent of what was requested:
+
+```json
+"effective": { "steps": 4, "cfg": 1, "sampler_name": "euler",
+               "scheduler": "simple", "width": 1024, "height": 1024 }
+```
+
+A staging assertion on those six values will catch any accidental change to the
+production baseline.
