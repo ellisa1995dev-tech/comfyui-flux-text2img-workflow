@@ -266,6 +266,35 @@ def image_ext(blob, fallback_name=""):
     return os.path.splitext(fallback_name)[1].lstrip(".") or "bin"
 
 
+def http_error_message(e):
+    """Readable message for an HTTP failure.
+
+    api() carries the response body in the exception's `msg`, which surfaces as
+    `reason`. Reading it back with e.read() returns nothing, because no file
+    object is attached -- that silently discarded the server's own explanation
+    and left a bare "HTTP 403:" with no detail.
+    """
+    body = (getattr(e, "reason", "") or "").strip()
+    lines = ["HTTP %s from %s" % (e.code, getattr(e, "url", "?"))]
+    if body:
+        lines.append("  server said: %s" % body[:400])
+    if e.code in (401, 403):
+        lines += [
+            "",
+            "  401/403 means the request was rejected before reaching any worker:",
+            "    - RUNPOD_API_KEY missing, stale, or revoked",
+            "    - the key belongs to another account, or is scoped to other",
+            "      endpoints and does not cover this --endpoint",
+            "    - the endpoint id is wrong",
+            "",
+            "  Test the key and endpoint independently:",
+            "    curl -s -o /dev/null -w '%{http_code}\\n' \\",
+            "      -H \"Authorization: Bearer $RUNPOD_API_KEY\" \\",
+            "      https://api.runpod.ai/v2/<ENDPOINT_ID>/health",
+        ]
+    return "\n".join(lines)
+
+
 def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
     """Submit one job and poll until it settles. Returns a result dict.
 
@@ -332,12 +361,20 @@ def run_one(base, key, prompt, seed, steps, interval, timeout, opts=None):
             }
 
         if status not in ("IN_QUEUE", "IN_PROGRESS"):
+            # "Job processing failed" is the stock worker's generic headline;
+            # the real ComfyUI messages live in output.details, because the SDK
+            # lifts `error` to the top level and leaves the rest behind.
+            out = job.get("output") or {}
+            details = out.get("details") or out.get("errors")
+            if isinstance(details, str):
+                details = [details]
             return {
                 "ok": False,
                 "id": job_id,
                 "status": status,
                 "worker": job.get("workerId"),
                 "error": job.get("error") or "job %s" % status,
+                "details": details or [],
             }
 
         time.sleep(interval)
@@ -498,10 +535,26 @@ def main():
             print("  %2d  %-21s  %-14s  %s"
                   % (r["run"], (r.get("status") or "ERROR")[:21],
                      (r.get("worker") or "?")[:14], str(r.get("error"))[:50]))
+            for d in (r.get("details") or [])[:3]:
+                print("        %s" % str(d)[:100])
         rows.append(r)
 
     cold, warm = summarize(rows)
     failed = [r for r in rows if not r.get("ok")]
+
+    if failed:
+        print()
+        print("  FAILURES (%d of %d)" % (len(failed), len(rows)))
+        seen = {}
+        for r in failed:
+            key = (str(r.get("error")), tuple(str(d) for d in (r.get("details") or [])))
+            seen.setdefault(key, []).append(r["run"])
+        for (err, details), runs in seen.items():
+            print("    x%-3d %s" % (len(runs), err))
+            for d in details[:5]:
+                print("         %s" % d[:160])
+            if not details:
+                print("         (no details returned; check the endpoint's Logs tab)")
 
     # Verify what the sampler actually ran. A step comparison is worthless if
     # the requested count never reached the node, and that failure is silent:
@@ -689,6 +742,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except urllib.error.HTTPError as e:
-        sys.exit("HTTP %s: %s" % (e.code, e.read().decode()[:300]))
+        sys.exit(http_error_message(e))
     except KeyboardInterrupt:
         sys.exit(130)
