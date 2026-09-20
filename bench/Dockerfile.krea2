@@ -1,0 +1,70 @@
+# Krea 2 Turbo - evaluation image (benchmark only, NOT production).
+#
+# Deploy as a SEPARATE RunPod endpoint alongside the current one:
+#   Dockerfile path: /bench/Dockerfile.krea2
+# Production (bench/Dockerfile.klein4b) is untouched by this file.
+#
+# Purpose: answer two questions with one build.
+#   1. Does this base image's ComfyUI support Krea 2 at all? (see the probe below)
+#   2. At the SAME settings as klein 4B -- 1024x1024, euler/simple, CFG 1.0 --
+#      how fast is Krea 2 Turbo, and does its output look better?
+#
+# The graph is bench/api-workflow-krea2.json: the klein 4B workflow with the
+# three model files swapped, EmptyFlux2LatentImage -> EmptyLatentImage, and
+# steps 4 -> 8 (Krea's published setting for the Turbo checkpoint). Resolution
+# and sampler are deliberately unchanged so the comparison isolates the model.
+#
+# No LoRAs. A base-model measurement is what the latency and quality questions
+# actually need, and it keeps the image reproducible from public sources.
+FROM runpod/worker-comfyui:5.10.0-base
+
+# Re-assert the base image's pins in case any later step disturbs them.
+RUN uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# --- Krea 2 support probe ------------------------------------------------
+# Krea 2's weights were published after this base image was pinned, so the
+# bundled ComfyUI may not know the `krea2` CLIP type that api-workflow-krea2
+# requires. This runs BEFORE the ~19 GB of downloads so the answer is in the
+# log within a minute or two of starting the build.
+#
+# It reports rather than gates, for the same reason scripts/validate_build.py
+# does: BuildKit shows only its own error footer when a step fails, never the
+# step's output, so a hard failure here would be invisible. After the build,
+# search the log for "KREA2 PROBE".
+RUN python -c "\
+import sys, os; os.chdir('/comfyui'); sys.path.insert(0, '/comfyui'); \
+sys.argv = ['main.py', '--cpu']; \
+import comfy.options; comfy.options.enable_args_parsing(); \
+import nodes; \
+t = nodes.NODE_CLASS_MAPPINGS['CLIPLoader'].INPUT_TYPES()['required']['type'][0]; \
+print('KREA2 PROBE - CLIPLoader accepts:', list(t)); \
+print('KREA2 PROBE - RESULT:', 'krea2 SUPPORTED' if 'krea2' in t else 'krea2 NOT SUPPORTED - this base image cannot run the workflow; a newer ComfyUI is required')" \
+    || echo "KREA2 PROBE - could not introspect CLIPLoader; check the first request instead"
+
+# --- models --------------------------------------------------------------
+# Official Comfy-Org repackaging. All three are ungated, so no HF_TOKEN is
+# needed or accepted -- the same reason bench/Dockerfile.klein4b dropped it.
+# Do not substitute a community re-quantisation: several exist at bf16, int8
+# and nvfp4, and swapping precision silently changes both output and VRAM.
+ARG KREA2_UNET_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors"
+ARG KREA2_TE_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors"
+ARG KREA2_VAE_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors"
+
+# Hugging Face rate-limits anonymous downloads per source IP, and RunPod's
+# shared build machines get throttled: a build can see HTTP 429 rejected
+# instantly on every attempt for several minutes. Backoff is therefore long
+# (60/120/300/600/900s ~= 18 min total) -- waiting beats a failed 20 GB build.
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_UNET_URL" --relative-path models/unet --filename 'krea2_turbo_fp8_scaled.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_TE_URL" --relative-path models/text_encoders --filename 'qwen3vl_4b_fp8_scaled.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_VAE_URL" --relative-path models/vae --filename 'qwen_image_vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+
+# serverless wiring - identical to production: start.sh already boots ComfyUI
+# and then runs `python -u /handler.py`, so no CMD/ENTRYPOINT override.
+RUN test -f /handler.py && mv /handler.py /worker_comfyui_handler.py
+COPY bench/api-workflow-krea2.json /api-workflow.json
+COPY handler.py /handler.py
+COPY test_input.json /test_input.json
+
+# build-time report (always exits 0; see scripts/validate_build.py)
+COPY scripts/validate_build.py /validate_build.py
+RUN python /validate_build.py
