@@ -14,8 +14,11 @@
 # steps 4 -> 8 (Krea's published setting for the Turbo checkpoint). Resolution
 # and sampler are deliberately unchanged so the comparison isolates the model.
 #
-# No LoRAs. A base-model measurement is what the latency and quality questions
-# actually need, and it keeps the image reproducible from public sources.
+# LoRAs: three are baked in (see the LoRA section below). Be aware this breaks
+# the like-for-like comparison with bench/Dockerfile.klein4b, which carries
+# none -- any latency or quality delta measured against it now mixes the model
+# change with the LoRA stack. Build without the LoRA build-args if the
+# base-model numbers are what is wanted.
 FROM runpod/worker-comfyui:5.10.0-base
 
 # Re-assert the base image's pins in case any later step disturbs them.
@@ -50,6 +53,33 @@ ARG KREA2_UNET_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusi
 ARG KREA2_TE_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors"
 ARG KREA2_VAE_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors"
 
+# --- LoRAs ---------------------------------------------------------------
+# No defaults: unlike the three models above, these are not published at a
+# stable public URL, so each must be supplied at build time:
+#
+#   docker build -f bench/Dockerfile.krea2 \
+#     --build-arg MYSTICXXX_LORA_URL=... \
+#     --build-arg BLOOMGIRLS_LORA_URL=... \
+#     --build-arg FAMEGRID_LORA_URL=... .
+#
+# The on-disk filenames below are fixed and must match the `lora_name` input
+# of whichever LoraLoaderModelOnly node references them -- ComfyUI validates
+# lora_name against the contents of models/loras when the prompt is submitted,
+# and rejects the WHOLE graph if the file is absent.
+#
+# If a source needs credentials (a Civitai token, a gated HF repo), put it in
+# the URL or use `RUN --mount=type=secret`. Do not add it as a plain ARG:
+# build-args persist in the image's history metadata.
+ARG MYSTICXXX_LORA_URL=""
+ARG BLOOMGIRLS_LORA_URL=""
+ARG FAMEGRID_LORA_URL=""
+
+# Fail fast on a missing URL. Placed before the ~19 GB of model downloads so
+# a forgotten build-arg costs seconds rather than twenty minutes. BuildKit
+# shows only its own footer when a step fails (see the probe above), so if the
+# build stops here with no visible reason, it is this check.
+RUN [ -n "$MYSTICXXX_LORA_URL" ] || { echo "missing --build-arg MYSTICXXX_LORA_URL -- see the LoRA section of this Dockerfile" >&2; exit 1; }; [ -n "$BLOOMGIRLS_LORA_URL" ] || { echo "missing --build-arg BLOOMGIRLS_LORA_URL -- see the LoRA section of this Dockerfile" >&2; exit 1; }; [ -n "$FAMEGRID_LORA_URL" ] || { echo "missing --build-arg FAMEGRID_LORA_URL -- see the LoRA section of this Dockerfile" >&2; exit 1; }
+
 # Hugging Face rate-limits anonymous downloads per source IP, and RunPod's
 # shared build machines get throttled: a build can see HTTP 429 rejected
 # instantly on every attempt for several minutes. Backoff is therefore long
@@ -57,6 +87,14 @@ ARG KREA2_VAE_URL="https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen
 RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_UNET_URL" --relative-path models/unet --filename 'krea2_turbo_fp8_scaled.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_TE_URL" --relative-path models/text_encoders --filename 'qwen3vl_4b_fp8_scaled.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KREA2_VAE_URL" --relative-path models/vae --filename 'qwen_image_vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+
+# LoRAs land in models/loras specifically. scripts/validate_build.py finds a
+# model anywhere under models/, but LoraLoaderModelOnly builds its lora_name
+# combo from this folder alone -- a file reported OK elsewhere is invisible to
+# the loader. Same backoff as above: these sources rate-limit too.
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$MYSTICXXX_LORA_URL" --relative-path models/loras --filename 'MysticXXX_KREA2_v1.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$BLOOMGIRLS_LORA_URL" --relative-path models/loras --filename 'krea2-bloomgirls-realism-step00004000.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$FAMEGRID_LORA_URL" --relative-path models/loras --filename 'famegrid_spicy.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 
 # serverless wiring - identical to production: start.sh already boots ComfyUI
 # and then runs `python -u /handler.py`, so no CMD/ENTRYPOINT override.
