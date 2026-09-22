@@ -1,0 +1,70 @@
+# FLUX.2 [klein] 9B - evaluation image (NOT production).
+#
+# Deploy as a SEPARATE RunPod endpoint:
+#   Dockerfile path: /bench/Dockerfile.klein9b
+#
+# Graph: bench/api-workflow-klein9b.json, converted from the customer's UI
+# workflow (Flux.2-Klein-9b-Text-To-Image.json). Node ids are preserved from
+# that file so the two cross-reference 1:1. Sampler settings are carried over
+# verbatim: 4 steps, euler/simple, CFG 1.0 with FluxGuidance 4.0, 1024x1024.
+#
+# LICENCE -- READ BEFORE PROMOTING THIS TO PRODUCTION.
+# docs/PIPELINE.md records klein 9B as DISQUALIFIED: BFL's model card puts 4B
+# under Apache-2.0 and 9B under a non-commercial licence. bench/Dockerfile.
+# klein4b exists precisely because of that. This image is for evaluation; if
+# it is to serve customers, the licence has to be resolved first.
+#
+# HARDWARE. The text encoder this workflow names is qwen_3_8b_fp4mixed --
+# an nvfp4 build, which wants Blackwell-class hardware (see the note in
+# bench/Dockerfile.klein4b). On an older GPU it will either refuse to load or
+# fall back to a slow emulated path. Either restrict the endpoint to Blackwell
+# GPUs, or override KLEIN9B_TE_URL with the bf16 encoder and change
+# clip_name in the workflow to match. Also size the GPU for 9B weights plus an
+# 8B encoder resident at once -- do not assume the 16 GB tier is enough.
+#
+# No custom nodes: every class_type in the graph ships with ComfyUI, and both
+# `flux2` CLIP type and EmptyFlux2LatentImage are already proven on this base
+# image by the klein 4B build. No support probe is therefore needed.
+FROM runpod/worker-comfyui:5.10.0-base
+
+# Re-assert the base image's pins in case any later step disturbs them.
+RUN uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# --- models --------------------------------------------------------------
+# The VAE default is the URL carried in the source workflow's own VAELoader
+# node properties. The diffusion model and text encoder are NOT published at a
+# URL this repo can verify, so they have no defaults and must be supplied:
+#
+#   docker build -f bench/Dockerfile.klein9b \
+#     --build-arg KLEIN9B_UNET_URL=... \
+#     --build-arg KLEIN9B_TE_URL=... .
+#
+# 9B is a gated BFL repo, so the URL will need credentials. Put a token in the
+# URL or use `RUN --mount=type=secret`; do NOT add it as a plain ARG, because
+# build-args persist in the image's history metadata.
+ARG KLEIN9B_UNET_URL=""
+ARG KLEIN9B_TE_URL=""
+ARG KLEIN9B_VAE_URL="https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors"
+
+# Fail fast on a missing URL, before the tens of GB below: BuildKit shows only
+# its own footer when a step fails, so if the build stops here with no visible
+# reason, it is this check.
+RUN [ -n "$KLEIN9B_UNET_URL" ] || { echo "missing --build-arg KLEIN9B_UNET_URL -- see the models section of this Dockerfile" >&2; exit 1; }; [ -n "$KLEIN9B_TE_URL" ] || { echo "missing --build-arg KLEIN9B_TE_URL -- see the models section of this Dockerfile" >&2; exit 1; }
+
+# Hugging Face rate-limits anonymous downloads per source IP and RunPod's
+# shared build machines get throttled, so the backoff is long
+# (60/120/300/600/900s ~= 18 min total) -- waiting beats a failed build.
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN9B_UNET_URL" --relative-path models/unet --filename 'flux-2-klein-9b.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN9B_TE_URL" --relative-path models/text_encoders --filename 'qwen_3_8b_fp4mixed.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+RUN BACKOFFS="60 120 300 600 900" && for i in 1 2 3 4 5; do comfy model download --url "$KLEIN9B_VAE_URL" --relative-path models/vae --filename 'flux2-vae.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
+
+# serverless wiring - identical to production: start.sh already boots ComfyUI
+# and then runs `python -u /handler.py`, so no CMD/ENTRYPOINT override.
+RUN test -f /handler.py && mv /handler.py /worker_comfyui_handler.py
+COPY bench/api-workflow-klein9b.json /api-workflow.json
+COPY handler.py /handler.py
+COPY test_input.json /test_input.json
+
+# build-time report (always exits 0; see scripts/validate_build.py)
+COPY scripts/validate_build.py /validate_build.py
+RUN python /validate_build.py
